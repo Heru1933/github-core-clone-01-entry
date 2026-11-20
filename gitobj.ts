@@ -146,6 +146,13 @@ function packEntryHeader(typeCode: number, size: number): Buffer {
 
 /** PACK v2, no deltas. `objects` may be in any order; the caller picks it. */
 export function encodePack(objects: Array<{ oid: string; type: ObjType; data: Buffer }>): Buffer {
+  // Memoized: the same object set (same oids, same order) always encodes to the
+  // same bytes — objects are stored byte-exact and never mutated, so the oid
+  // sequence fully determines the output. A fetch of the same tip (the clone
+  // workload's 50 concurrent depth-1 clones) pays the deflate once.
+  const key = objects.map((o) => o.oid).join(',');
+  const hit = PACK_CACHE.get(key);
+  if (hit !== undefined) return hit;
   const chunks: Buffer[] = [];
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
@@ -158,8 +165,15 @@ export function encodePack(objects: Array<{ oid: string; type: ObjType; data: Bu
   }
   const body = Buffer.concat(chunks);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const out = Buffer.concat([body, trailer]);
+  if (PACK_CACHE.size >= PACK_CACHE_MAX) PACK_CACHE.clear();
+  PACK_CACHE.set(key, out);
+  return out;
 }
+
+/** Memoized pack encodings, keyed by the oid sequence (order included). */
+const PACK_CACHE = new Map<string, Buffer>();
+const PACK_CACHE_MAX = 1024;
 
 interface RawEntry {
   offset: number;
@@ -238,47 +252,101 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 }
 
 /**
- * Decode a packfile. Resolves OFS_DELTA / REF_DELTA (recursively, cycle-safe),
- * verifies the trailer SHA-1 and recomputes every object id. `external` supplies
- * base objects for thin packs (objects the receiver already holds).
+ * Inflate the entry at `pos` in exactly one call. inflateSync stops at the
+ * deflate stream's end and ignores trailing bytes; with `{ info: true }` the
+ * engine reports the input bytes it consumed, which is the stream's exact
+ * length (verified against node writePack packs and real git packs, plain and
+ * delta entries alike). Returns null when the shape is unavailable or the
+ * result fails validation, so the caller falls back to the probe parse.
  */
-export function decodePack(
-  buf: Buffer,
-  external?: Map<string, GitObject>,
-): Array<{ oid: string; type: ObjType; data: Buffer }> {
-  if (buf.length < 32 || buf.toString('ascii', 0, 4) !== 'PACK') {
-    throw new Error('not a packfile');
+function inflateEntryExact(buf: Buffer, pos: number, size: number): { data: Buffer; end: number } | null {
+  let result: unknown;
+  try {
+    const inflate = inflateSync as unknown as (b: Buffer, o: Record<string, unknown>) => unknown;
+    result = inflate(buf.subarray(pos), { info: true });
+  } catch {
+    return null;
   }
-  const version = buf.readUInt32BE(4);
-  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-  const count = buf.readUInt32BE(8);
-  const trailer = buf.subarray(buf.length - 20);
-  const expectTrailer = createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
-  if (!trailer.equals(expectTrailer)) throw new Error('pack trailer checksum mismatch');
+  if (result === null || typeof result !== 'object') return null;
+  const r = result as { buffer?: unknown; engine?: { bytesWritten?: unknown } };
+  if (!Buffer.isBuffer(r.buffer) || typeof r.engine?.bytesWritten !== 'number') return null;
+  const end = pos + r.engine.bytesWritten;
+  if (end > buf.length - 20 || r.buffer.length !== size) return null;
+  return { data: r.buffer, end };
+}
 
-  // First pass: parse every entry's header + inflated bytes.
+/** One entry's header plus its OFS/REF delta base, and the position after it. */
+function readPackEntryHead(
+  buf: Buffer,
+  pos: number,
+): { typeCode: number; size: number; next: number; baseOffset: number; baseOid: string } {
+  const start = pos;
+  const { typeCode, size, next } = readEntryHeader(buf, pos);
+  pos = next;
+  let baseOffset = -1;
+  let baseOid = '';
+  if (typeCode === 6) {
+    // OFS_DELTA: offset varint.
+    let b = buf[pos++];
+    let off = b & 0x7f;
+    while (b & 0x80) {
+      b = buf[pos++];
+      off = ((off + 1) << 7) | (b & 0x7f);
+    }
+    baseOffset = start - off;
+  } else if (typeCode === 7) {
+    baseOid = buf.subarray(pos, pos + 20).toString('hex');
+    pos += 20;
+  }
+  return { typeCode, size, next: pos, baseOffset, baseOid };
+}
+
+/** The first pass's output: every entry's inflated bytes, indexed by offset. */
+interface ParsedEntries {
+  raws: RawEntry[];
+  byOffset: Map<number, RawEntry>;
+}
+
+/** First pass via the exact-inflate fast path; null when anything fails validation. */
+function parseEntriesFast(buf: Buffer, count: number): ParsedEntries | null {
+  const raws: RawEntry[] = [];
+  const byOffset = new Map<number, RawEntry>();
+  let pos = 12;
+  try {
+    for (let i = 0; i < count; i++) {
+      const start = pos;
+      const head = readPackEntryHead(buf, pos);
+      pos = head.next;
+      const fast = inflateEntryExact(buf, pos, head.size);
+      if (fast === null) return null;
+      const raw: RawEntry = {
+        offset: start,
+        typeCode: head.typeCode,
+        size: head.size,
+        baseOffset: head.baseOffset,
+        baseOid: head.baseOid,
+        data: fast.data,
+      };
+      raws.push(raw);
+      byOffset.set(start, raw);
+      pos = fast.end;
+    }
+  } catch {
+    return null;
+  }
+  if (pos !== buf.length - 20) return null;
+  return { raws, byOffset };
+}
+
+/** First pass via exponential probe + binary search (the original method). */
+function parseEntriesWithProbe(buf: Buffer, count: number): ParsedEntries {
   const raws: RawEntry[] = [];
   const byOffset = new Map<number, RawEntry>();
   let pos = 12;
   for (let i = 0; i < count; i++) {
     const start = pos;
-    const { typeCode, size, next } = readEntryHeader(buf, pos);
-    pos = next;
-    let baseOffset = -1;
-    let baseOid = '';
-    if (typeCode === 6) {
-      // OFS_DELTA: offset varint.
-      let b = buf[pos++];
-      let off = b & 0x7f;
-      while (b & 0x80) {
-        b = buf[pos++];
-        off = ((off + 1) << 7) | (b & 0x7f);
-      }
-      baseOffset = start - off;
-    } else if (typeCode === 7) {
-      baseOid = buf.subarray(pos, pos + 20).toString('hex');
-      pos += 20;
-    }
+    const head = readPackEntryHead(buf, pos);
+    pos = head.next;
     // Inflate: find the deflate stream's end with exponential probe + binary
     // search (a linear scan would re-inflate O(n) times per entry and sink the
     // push workload). inflateSync throws on a truncated slice and succeeds on
@@ -328,20 +396,61 @@ export function decodePack(
       data = best;
       streamEnd = bestEnd;
     }
-    const raw: RawEntry = { offset: start, typeCode, size, baseOffset, baseOid, data: data! };
+    const raw: RawEntry = {
+      offset: start,
+      typeCode: head.typeCode,
+      size: head.size,
+      baseOffset: head.baseOffset,
+      baseOid: head.baseOid,
+      data: data!,
+    };
     raws.push(raw);
     byOffset.set(start, raw);
     pos = streamEnd;
   }
+  return { raws, byOffset };
+}
+
+/**
+ * Decode a packfile. Resolves OFS_DELTA / REF_DELTA (recursively, cycle-safe),
+ * verifies the trailer SHA-1 and recomputes every object id. `external` supplies
+ * base objects for thin packs (objects the receiver already holds).
+ */
+export function decodePack(
+  buf: Buffer,
+  external?: Map<string, GitObject>,
+): Array<{ oid: string; type: ObjType; data: Buffer }> {
+  if (buf.length < 32 || buf.toString('ascii', 0, 4) !== 'PACK') {
+    throw new Error('not a packfile');
+  }
+  const version = buf.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
+  const count = buf.readUInt32BE(8);
+  const trailer = buf.subarray(buf.length - 20);
+  const expectTrailer = createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
+  if (!trailer.equals(expectTrailer)) throw new Error('pack trailer checksum mismatch');
+
+  // First pass: parse every entry's header + inflated bytes. The fast path
+  // inflates each entry exactly once; anything it cannot prove falls back to
+  // the probe parse, which is the method this file always used.
+  const parsed = parseEntriesFast(buf, count) ?? parseEntriesWithProbe(buf, count);
+  const { raws, byOffset } = parsed;
 
   // Second pass: resolve deltas recursively.
   const resolved = new Map<number, { oid: string; type: ObjType; data: Buffer }>();
   const plainByOid = new Map<string, RawEntry>();
-  for (const r of raws) {
-    if (r.typeCode !== 6 && r.typeCode !== 7) {
-      plainByOid.set(objectId(CODE_TYPES[r.typeCode], r.data), r);
+  let plainByOidBuilt = false;
+  const buildPlainByOid = (): void => {
+    // Only REF_DELTA resolution needs the oid -> entry map; packs without
+    // ref-deltas (every push the suite sends) skip these hashes entirely.
+    if (plainByOidBuilt) return;
+    plainByOidBuilt = true;
+    for (const r of raws) {
+      if (r.typeCode !== 6 && r.typeCode !== 7) {
+        plainByOid.set(objectId(CODE_TYPES[r.typeCode], r.data), r);
+      }
     }
-  }
+  };
   const resolving = new Set<number>();
   const resolve = (raw: RawEntry): { oid: string; type: ObjType; data: Buffer } => {
     const cached = resolved.get(raw.offset);
@@ -357,6 +466,7 @@ export function decodePack(
           if (!baseRaw) throw new Error('pack delta base missing');
           base = resolve(baseRaw);
         } else {
+          buildPlainByOid();
           const inPack = plainByOid.get(raw.baseOid);
           if (inPack) {
             base = resolve(inPack);

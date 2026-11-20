@@ -169,6 +169,15 @@ export class Store {
     return oid;
   }
 
+  /**
+   * Store an object whose oid is already known (the pack decoder verified it
+   * by recomputing it); skips re-hashing. Same "never rewrites" rule as
+   * putObject.
+   */
+  putObjectKnown(repo: Repo, oid: string, type: ObjType, data: Buffer): void {
+    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  }
+
   getObject(repo: Repo, oid: string): GitObject | undefined {
     return repo.objects.get(oid);
   }

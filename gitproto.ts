@@ -470,7 +470,7 @@ function handleReceivePack(req: Req, res: ServerResponse, repo: Repo, store: Sto
         // `external` lets thin-pack REF_DELTA bases resolve against objects
         // the repo already holds. Objects are stored byte-exact as pushed.
         const objects = decodePack(rest, repo.objects);
-        for (const o of objects) store.putObject(repo, o.type, o.data);
+        for (const o of objects) store.putObjectKnown(repo, o.oid, o.type, o.data);
       } catch (err) {
         unpackError = (err instanceof Error ? err.message : 'unpack failed').replace(/[\r\n]+/g, ' ');
       }
